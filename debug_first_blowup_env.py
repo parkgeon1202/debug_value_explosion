@@ -159,26 +159,30 @@ def _grab_phys(env):
 
 def _install_push_hook():
     try:
+        import functools
         import isaaclab.envs.mdp.events as ev
         if not hasattr(ev, "push_by_setting_velocity"):
             print("[fb] ✗ push 함수 못 찾음")
             return False
         _orig = ev.push_by_setting_velocity
 
-        def _patched(env, env_ids, velocity_range, asset_cfg=None, **kw):
-            _PUSH["step"] = _STEP["n"]
+        # 원본 시그니처를 그대로 보존해야 IsaacLab EventManager 의 인자 검사를
+        # 통과한다. **kw 를 추가하면 'kw' 를 필수 파라미터로 오인해 에러가 난다.
+        @functools.wraps(_orig)
+        def _patched(*args, **kwargs):
             try:
+                _PUSH["step"] = _STEP["n"]
+                env_ids = args[1] if len(args) > 1 else kwargs.get("env_ids")
                 _PUSH["ids"] = set(env_ids.detach().tolist()) if env_ids is not None else None
             except Exception:
                 _PUSH["ids"] = None
             try:
-                xr = velocity_range.get("x", (0, 0)); yr = velocity_range.get("y", (0, 0))
+                vr = args[2] if len(args) > 2 else kwargs.get("velocity_range", {})
+                xr = vr.get("x", (0, 0)); yr = vr.get("y", (0, 0))
                 _PUSH["mag"] = max(abs(xr[0]), abs(xr[1]), abs(yr[0]), abs(yr[1]))
             except Exception:
                 _PUSH["mag"] = float("nan")
-            if asset_cfg is not None:
-                return _orig(env, env_ids, velocity_range, asset_cfg, **kw)
-            return _orig(env, env_ids, velocity_range, **kw)
+            return _orig(*args, **kwargs)
 
         ev.push_by_setting_velocity = _patched
         print("[fb] ✓ push 후킹 완료")
