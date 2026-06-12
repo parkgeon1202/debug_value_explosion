@@ -1,73 +1,49 @@
 """
-debug_first_blowup_env.py  (v2: 민감도 ① 측정 추가)
+debug_first_blowup_env.py  (v3)
 ========================================================================
-"4096개 env 중 '처음으로' action 이 임계를 넘는 env 하나를 감지 → 그 env id 를
-잠그고 → 그 env 의 폭발 '직전' 궤적과 '직후' 궤적을 따라간다."
-+ 추가: 그 env 의 매 스텝 '정책 민감도 ①' 를 같이 찍는다.
+4096 env 중 '처음' action 이 임계를 넘는 env 한 마리를 잠그고, 그 env 의
+폭발 직전(ring)·직후 궤적을 추적한다.
 
-민감도 ① (방식 A — 스텝 간 비율):
-    d_act_d_lact = |action(t) - action(t-1)|_max / |last_act(t) - last_act(t-1)|_max
-        → 이게 곧 ∂action/∂last_action 의 근사 = "루프 게인".
-          1 을 넘으면 'last_action 이 조금 변할 때 action 이 더 크게 변한다'
-          = 자기증폭(발산) 영역. push 직후 이 값이 1 을 넘어 커지는지 본다.
+v3 변경점:
+  1) FB_WARN 기본값 상향 (정상 보행 action 출렁임을 건너뛰고 '진짜 폭발'만). 기본 100.
+  2) 물리값을 못 읽으면 nan 대신 'none' 으로 명시 출력 (계산실패 nan 과 구분).
+  3) 방식 B 추가: 자동미분으로 '순수' d(action)/d(last_action) (= 진짜 루프 게인)
+     을 측정. 방식 A(차분 dA/dL)는 다른 obs 변화가 섞여 부정확하므로 B 로 확정.
 
-    d_act_d_obs = |Δaction|_max / |Δ(policy obs 전체)|_max
-        → 전체 입력 변화 대비 출력 변화. 작은 입력 변화에 출력이 튀면 크다.
+측정값:
+  GANG  : (방식B) d(action)/d(last_action) 자코비안 최대 절대성분. 순수 게인. 신뢰지표.
+  dA/dL : (방식A) |Δaction|/|Δlast_action|. 근사(다른 obs 섞임).
+  dA/dO : (방식A) |Δaction|/|Δobs전체|.
 
-    ※ 방식 A 는 '근사'다(두 스텝의 차분). 정확한 야코비안(자동미분)은 방식 B 로
-      별도. 먼저 A 로 1 넘는 게 보이면 B 로 확정하는 순서를 권장.
-
-읽는 법:
-    잠긴 env 한 마리의 시간축 표. 폭발(▶) 기준 위(과거)/아래(이후).
-      - dA/dL (=d_act_d_lact) 이 push 직후 1 을 넘어 커지나? → 민감영역 진입 = 가설 확정
-      - dA/dL 이 매 스텝 일정? → 일정 게인의 기하급수 발산
-      - 입력(joint_*/imu_*)은 작게 변하는데 ACT 만 크게? → 출력 증폭(민감)
-      - push=★ 가 dA/dL 상승 몇 스텝 전인가? → push→민감화 지연
-
-────────────────────────────────────────────────────────────────────────
-사용법:
-    train.py 에:  import debug_first_blowup_env   # noqa
-
+사용법:  train.py 에:  import debug_first_blowup_env   # noqa
 환경변수:
-    FB_WARN  = 5.0   action |max| 가 이 값 넘으면 "첫 폭발"로 감지·잠금
-    FB_RING  = 60    폭발 감지 시 되짚을 직전 스텝 수
-    FB_AFTER = 60    폭발 감지 후 따라갈 스텝 수
-    FB_DIM   = 0     policy obs 차원 강제(0=자동). 45(proj_grav 활성) 또는 42.
+  FB_WARN=100  FB_RING=60  FB_AFTER=60  FB_DIM=0(자동)  FB_JAC=1(방식B on)
 """
 
 import os
 import collections
 import torch
 
-FB_WARN  = float(os.environ.get("FB_WARN", "5.0"))
+FB_WARN  = float(os.environ.get("FB_WARN", "100"))
 FB_RING  = int(float(os.environ.get("FB_RING", "60")))
 FB_AFTER = int(float(os.environ.get("FB_AFTER", "60")))
 FB_DIM   = int(float(os.environ.get("FB_DIM", "0")))
+FB_JAC   = int(float(os.environ.get("FB_JAC", "1")))
 
-# policy obs 항목 경계 — 45차원(projected_gravity 활성) 기준.
 _TERMS_45 = [
-    ("proj_grav",  0,  3),
-    ("vel_cmd",    3,  6),
-    ("joint_pos",  6, 18),
-    ("joint_vel", 18, 30),
-    ("imu_ang_v", 30, 33),
-    ("last_act",  33, 45),
+    ("proj_grav",  0,  3), ("vel_cmd",    3,  6), ("joint_pos",  6, 18),
+    ("joint_vel", 18, 30), ("imu_ang_v", 30, 33), ("last_act",  33, 45),
 ]
 _TERMS_42 = [
-    ("vel_cmd",    0,  3),
-    ("joint_pos",  3, 15),
-    ("joint_vel", 15, 27),
-    ("imu_ang_v", 27, 30),
-    ("last_act",  30, 42),
+    ("vel_cmd",    0,  3), ("joint_pos",  3, 15), ("joint_vel", 15, 27),
+    ("imu_ang_v", 27, 30), ("last_act",  30, 42),
 ]
-# lact_lo/hi: last_action 의 obs 내 인덱스 (민감도 분모용)
 _TERMS = {"cur": _TERMS_45, "dim": 45, "lact": (33, 45)}
 
 _STEP = {"n": 0}
 _RING = collections.deque(maxlen=FB_RING)
 _LOCK = {"env": None, "left": 0, "done": False}
 _PUSH = {"step": -10, "ids": None, "mag": float("nan")}
-# 잠긴 env 의 직전 스냅샷(민감도 차분용)
 _PREV = {"pobs": None, "act": None}
 
 
@@ -80,8 +56,18 @@ def _resolve_dim(d):
         _TERMS["cur"], _TERMS["dim"], _TERMS["lact"] = _TERMS_45, 45, (33, 45)
 
 
-def _sens(snap, prev, e):
-    """env e 의 스텝 간 민감도 (dA/dL, dA/dObs). prev 없으면 nan."""
+def _fmtp(x):
+    if x is None:
+        return "none"
+    try:
+        if x != x:
+            return "nan"
+        return f"{x:.2e}"
+    except Exception:
+        return "none"
+
+
+def _sens_A(snap, prev, e):
     if prev is None or prev.get("pobs") is None:
         return float("nan"), float("nan")
     try:
@@ -90,19 +76,40 @@ def _sens(snap, prev, e):
         d_lact = (snap["pobs"][e, lo:hi] - prev["pobs"][e, lo:hi]).abs().max().item()
         d_obs = (snap["pobs"][e] - prev["pobs"][e]).abs().max().item()
         eps = 1e-6
-        dA_dL = d_act / (d_lact + eps)
-        dA_dO = d_act / (d_obs + eps)
-        return dA_dL, dA_dO
+        return d_act / (d_lact + eps), d_act / (d_obs + eps)
     except Exception:
         return float("nan"), float("nan")
 
 
-def _row_for_env(snap, e, prev=None):
-    pobs = snap["pobs"]
-    act = snap["act"]
-    terms = _TERMS["cur"]
+def _gain_jacobian(policy, full_obs, e):
+    """d(actor mean)/d(last_action) 의 최대 절대성분 + frob norm."""
+    if not FB_JAC:
+        return float("nan"), float("nan")
+    try:
+        lo, hi = _TERMS["lact"]
+        with torch.enable_grad():
+            aobs = policy.get_actor_obs(full_obs).detach()
+            x = aobs[e:e + 1].clone()
+            x.requires_grad_(True)
+            xn = policy.actor_obs_normalizer(x) if hasattr(policy, "actor_obs_normalizer") else x
+            mean = policy.actor(xn)
+            A = mean.shape[-1]
+            gmax = 0.0
+            gsq = 0.0
+            for a in range(A):
+                g = torch.autograd.grad(mean[0, a], x, retain_graph=(a < A - 1),
+                                        create_graph=False)[0][0, lo:hi]
+                gmax = max(gmax, g.abs().max().item())
+                gsq += float((g * g).sum().item())
+            return gmax, gsq ** 0.5
+    except Exception:
+        return float("nan"), float("nan")
+
+
+def _row_for_env(snap, e, prev=None, policy=None, full_obs=None):
+    pobs = snap["pobs"]; act = snap["act"]
     parts = []
-    for name, lo, hi in terms:
+    for name, lo, hi in _TERMS["cur"]:
         try:
             v = pobs[e, lo:hi].abs().max().item()
         except Exception:
@@ -112,46 +119,58 @@ def _row_for_env(snap, e, prev=None):
         a = act[e].abs().max().item()
     except Exception:
         a = float("nan")
-    dA_dL, dA_dO = _sens(snap, prev, e)
-    rv = snap["root_v"][e].item() if snap["root_v"] is not None else float("nan")
-    av = snap["ang_v"][e].item() if snap["ang_v"] is not None else float("nan")
-    ia = snap["imu_a"][e].item() if snap["imu_a"] is not None else float("nan")
-    push = "★" if (snap["push_ids"] is not None and e in snap["push_ids"]) else " "
-    done = "✗" if (snap["dones"] is not None and bool(snap["dones"][e])) else " "
-    flag = "  <<<게인>1" if (dA_dL == dA_dL and dA_dL > 1.0) else ""  # nan-safe
+    dA_dL, dA_dO = _sens_A(snap, prev, e)
+    if policy is not None and full_obs is not None:
+        gang, gnorm = _gain_jacobian(policy, full_obs, e)
+    else:
+        gang, gnorm = float("nan"), float("nan")
+    rv = snap["root_v"][e].item() if snap["root_v"] is not None else None
+    av = snap["ang_v"][e].item() if snap["ang_v"] is not None else None
+    ia = snap["imu_a"][e].item() if snap["imu_a"] is not None else None
+    push = "*" if (snap["push_ids"] is not None and e in snap["push_ids"]) else " "
+    done = "X" if (snap["dones"] is not None and bool(snap["dones"][e])) else " "
+    gflag = "  <<<GANG>1" if (gang == gang and gang > 1.0) else \
+            ("  <<<dA/dL>1" if (gang != gang and dA_dL == dA_dL and dA_dL > 1.0) else "")
     return (f"  s{snap['step']:>8d} p{push} d{done} | " + " ".join(parts) +
-            f" → ACT={a:.3e} | dA/dL={dA_dL:.2f} dA/dO={dA_dO:.2f}"
-            f" | root_v={rv:.2e} ang_v={av:.2e} imu_a={ia:.2e}{flag}")
+            f" -> ACT={a:.3e} | GANG={_fmtp(gang)} dA/dL={dA_dL:.2f} dA/dO={dA_dO:.2f}"
+            f" | root_v={_fmtp(rv)} ang_v={_fmtp(av)} imu_a={_fmtp(ia)}{gflag}")
 
 
 def _dump_locked(e, trigger_step):
-    print(f"\n[fb] ===== env {e} 첫 폭발 감지 (step={trigger_step}, 임계 {FB_WARN}) =====")
-    print(f"[fb] 이 env 한 마리의 과거 {len(_RING)}스텝 + 이후 {FB_AFTER}스텝.")
-    print(f"[fb] p★=push  d✗=done | 각 obs단계 |max| → ACT | "
-          f"dA/dL=Δaction/Δlast_action(민감도①,루프게인) dA/dO=Δaction/Δobs | 물리")
-    print(f"[fb] ※ dA/dL > 1 이면 '민감영역(발산)'. push 직후 이게 1 넘어 커지는지 보세요.")
-    print("  " + "-" * 128)
+    print(f"\n[fb] ===== env {e} first blowup (step={trigger_step}, thr={FB_WARN}) =====")
+    print(f"[fb] past {len(_RING)} steps (GANG n/a) + next {FB_AFTER} steps (GANG on).")
+    print(f"[fb] GANG=d(action)/d(last_action) pure gain(B,trust) | dA/dL=diff approx(A) | phys none=read fail")
+    print(f"[fb] note: GANG > 1 = true divergence region. watch if GANG exceeds 1 after push.")
+    print("  " + "-" * 138)
     prev = None
     for snap in _RING:
         print(_row_for_env(snap, e, prev))
         prev = snap
-    # 이후 추적용 prev 시드
     _PREV["pobs"] = _RING[-1]["pobs"] if len(_RING) else None
     _PREV["act"] = _RING[-1]["act"] if len(_RING) else None
-    print(f"  {'─'*45} ▶ 위=과거 / 아래=이후 {'─'*45}")
+    print(f"  {'-'*48} > past / future {'-'*48}")
 
 
 def _grab_phys(env):
     out = {"root_v": None, "ang_v": None, "imu_a": None}
     try:
         robot = env.scene["robot"]
-        out["root_v"] = robot.data.root_lin_vel_w.detach().norm(dim=-1)
-        out["ang_v"] = robot.data.root_ang_vel_w.detach().norm(dim=-1)
+        try:
+            out["root_v"] = robot.data.root_lin_vel_w.detach().norm(dim=-1)
+        except Exception:
+            pass
+        try:
+            out["ang_v"] = robot.data.root_ang_vel_w.detach().norm(dim=-1)
+        except Exception:
+            pass
     except Exception:
         pass
     try:
         imu = env.scene["imu"]
-        out["imu_a"] = imu.data.lin_acc_b.detach().norm(dim=-1)
+        for attr in ("lin_acc_b", "lin_acc_w", "lin_acc"):
+            if hasattr(imu.data, attr):
+                out["imu_a"] = getattr(imu.data, attr).detach().norm(dim=-1)
+                break
     except Exception:
         pass
     return out
@@ -162,12 +181,10 @@ def _install_push_hook():
         import functools
         import isaaclab.envs.mdp.events as ev
         if not hasattr(ev, "push_by_setting_velocity"):
-            print("[fb] ✗ push 함수 못 찾음")
+            print("[fb] x push func not found")
             return False
         _orig = ev.push_by_setting_velocity
 
-        # 원본 시그니처를 그대로 보존해야 IsaacLab EventManager 의 인자 검사를
-        # 통과한다. **kw 를 추가하면 'kw' 를 필수 파라미터로 오인해 에러가 난다.
         @functools.wraps(_orig)
         def _patched(*args, **kwargs):
             try:
@@ -185,10 +202,10 @@ def _install_push_hook():
             return _orig(*args, **kwargs)
 
         ev.push_by_setting_velocity = _patched
-        print("[fb] ✓ push 후킹 완료")
+        print("[fb] v push hook ok")
         return True
     except Exception as e:
-        print(f"[fb] ✗ push 후킹 실패: {e}")
+        print(f"[fb] x push hook fail: {e}")
         return False
 
 
@@ -226,13 +243,12 @@ def _install_act_hook():
                 if _LOCK["env"] is not None:
                     e = _LOCK["env"]
                     prev = {"pobs": _PREV["pobs"], "act": _PREV["act"]}
-                    print(_row_for_env(snap, e, prev))
-                    _PREV["pobs"] = snap["pobs"]
-                    _PREV["act"] = snap["act"]
+                    print(_row_for_env(snap, e, prev, policy=self.policy, full_obs=obs))
+                    _PREV["pobs"] = snap["pobs"]; _PREV["act"] = snap["act"]
                     _LOCK["left"] -= 1
                     if _LOCK["left"] <= 0:
-                        print("  " + "-" * 128)
-                        print(f"[fb] ===== env {e} 추적 종료 =====\n")
+                        print("  " + "-" * 138)
+                        print(f"[fb] ===== env {e} trace end =====\n")
                         _LOCK["done"] = True
                     return actions
 
@@ -245,14 +261,14 @@ def _install_act_hook():
                     _LOCK["left"] = FB_AFTER
                     _dump_locked(e, step)
             except Exception as ex:
-                print(f"[fb] 처리 오류(무시): {ex}")
+                print(f"[fb] err(ignored): {ex}")
             return actions
 
         PPO.act = _patched_act
-        print(f"[fb] ✓ act 후킹 완료 (WARN={FB_WARN}, RING={FB_RING}, AFTER={FB_AFTER})")
+        print(f"[fb] v act hook ok (WARN={FB_WARN}, RING={FB_RING}, AFTER={FB_AFTER}, JAC={FB_JAC})")
         return True
     except Exception as e:
-        print(f"[fb] ✗ act 후킹 실패: {e}")
+        print(f"[fb] x act hook fail: {e}")
         return False
 
 
@@ -273,4 +289,4 @@ _install_env_ref()
 _install_push_hook()
 _ok = _install_act_hook()
 if _ok:
-    print("[fb] 준비 완료. 처음 터지는 env 한 마리를 잠가 과거·이후 + 민감도(dA/dL)를 추적합니다.")
+    print(f"[fb] ready (FB_WARN={FB_WARN}). lock first blowup env, trace past/future + GANG/dA-dL.")
