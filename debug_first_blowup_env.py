@@ -29,6 +29,10 @@ FB_RING  = int(float(os.environ.get("FB_RING", "60")))
 FB_AFTER = int(float(os.environ.get("FB_AFTER", "60")))
 FB_DIM   = int(float(os.environ.get("FB_DIM", "0")))
 FB_JAC   = int(float(os.environ.get("FB_JAC", "1")))
+FB_SKIP    = int(float(os.environ.get("FB_SKIP", "0")))      # 이 step 이전엔 감지 안 함(초기 스파이크 무시)
+FB_REPEAT  = int(float(os.environ.get("FB_REPEAT", "0")))    # 1이면 한 번 추적 후 다시 감시(반복). 0이면 1회.
+FB_PUSHWIN = int(float(os.environ.get("FB_PUSHWIN", "0")))   # >0이면 'push 발생 후 이 step 이내'에 터진 것만 감지
+FB_COOL    = int(float(os.environ.get("FB_COOL", "200")))    # 반복 모드에서 추적 종료 후 재감시까지 쿨다운
 
 _TERMS_45 = [
     ("proj_grav",  0,  3), ("vel_cmd",    3,  6), ("joint_pos",  6, 18),
@@ -42,7 +46,7 @@ _TERMS = {"cur": _TERMS_45, "dim": 45, "lact": (33, 45)}
 
 _STEP = {"n": 0}
 _RING = collections.deque(maxlen=FB_RING)
-_LOCK = {"env": None, "left": 0, "done": False}
+_LOCK = {"env": None, "left": 0, "done": False, "cool": 0}
 _PUSH = {"step": -10, "ids": None, "mag": float("nan")}
 _PREV = {"pobs": None, "act": None}
 
@@ -248,11 +252,27 @@ def _install_act_hook():
                     _LOCK["left"] -= 1
                     if _LOCK["left"] <= 0:
                         print("  " + "-" * 138)
-                        print(f"[fb] ===== env {e} trace end =====\n")
-                        _LOCK["done"] = True
+                        print(f"[fb] ===== env {e} trace end (step={step}) =====\n")
+                        if FB_REPEAT:
+                            # 반복 모드: 잠금 해제하고 쿨다운 후 재감시
+                            _LOCK["env"] = None
+                            _LOCK["cool"] = FB_COOL
+                            _PREV["pobs"] = None; _PREV["act"] = None
+                        else:
+                            _LOCK["done"] = True
                     return actions
 
                 _RING.append(snap)
+                # 쿨다운 중이면 감지 보류(반복 모드)
+                if _LOCK.get("cool", 0) > 0:
+                    _LOCK["cool"] -= 1
+                    return actions
+                # 초기 구간 무시
+                if step < FB_SKIP:
+                    return actions
+                # push 창 모드: 최근 push 후 FB_PUSHWIN step 이내만 감지
+                if FB_PUSHWIN > 0 and not (_PUSH["step"] >= step - FB_PUSHWIN):
+                    return actions
                 act_abs = actions.detach().abs().amax(dim=-1)
                 over = (act_abs > FB_WARN).nonzero(as_tuple=True)[0]
                 if over.numel() > 0:
