@@ -49,6 +49,7 @@ _RING = collections.deque(maxlen=FB_RING)
 _LOCK = {"env": None, "left": 0, "done": False, "cool": 0}
 _PUSH = {"step": -10, "ids": None, "mag": float("nan")}
 _PREV = {"pobs": None, "act": None}
+_GANG_DBG = {"printed": False}
 
 
 def _resolve_dim(d):
@@ -86,28 +87,66 @@ def _sens_A(snap, prev, e):
 
 
 def _gain_jacobian(policy, full_obs, e):
-    """d(actor mean)/d(last_action) 의 최대 절대성분 + frob norm."""
+    """d(actor mean)/d(last_action) 의 최대 절대성분 + frob norm.
+    여러 호출 방식을 시도하고, 첫 실패 시 원인을 1회 출력한다(_GANG_DBG).
+    """
     if not FB_JAC:
         return float("nan"), float("nan")
+    lo, hi = _TERMS["lact"]
     try:
-        lo, hi = _TERMS["lact"]
         with torch.enable_grad():
-            aobs = policy.get_actor_obs(full_obs).detach()
-            x = aobs[e:e + 1].clone()
-            x.requires_grad_(True)
-            xn = policy.actor_obs_normalizer(x) if hasattr(policy, "actor_obs_normalizer") else x
-            mean = policy.actor(xn)
+            # 1) actor 입력 obs 구성: get_actor_obs 가 있으면 쓰고, 없으면 full_obs 가
+            #    이미 actor obs(tensor)라고 가정.
+            if hasattr(policy, "get_actor_obs"):
+                aobs = policy.get_actor_obs(full_obs)
+            else:
+                aobs = full_obs
+            aobs = aobs.detach()
+            x = aobs[e:e + 1].clone().requires_grad_(True)
+
+            # 2) 정규화 통과(있으면)
+            if hasattr(policy, "actor_obs_normalizer"):
+                xn = policy.actor_obs_normalizer(x)
+            else:
+                xn = x
+
+            # 3) actor mean 계산: 여러 경로 시도
+            mean = None
+            if hasattr(policy, "actor") and isinstance(policy.actor, torch.nn.Module):
+                mean = policy.actor(xn)
+            elif hasattr(policy, "evaluate"):
+                mean = policy.evaluate(xn)
+            else:
+                # 최후: act_inference 류 (단 grad 유지 필요)
+                mean = policy.act_inference(xn) if hasattr(policy, "act_inference") else None
+            if mean is None:
+                raise RuntimeError("no actor forward path found")
+            if not mean.requires_grad:
+                raise RuntimeError("mean has no grad (actor path detached)")
+
             A = mean.shape[-1]
             gmax = 0.0
             gsq = 0.0
             for a in range(A):
                 g = torch.autograd.grad(mean[0, a], x, retain_graph=(a < A - 1),
-                                        create_graph=False)[0][0, lo:hi]
-                gmax = max(gmax, g.abs().max().item())
-                gsq += float((g * g).sum().item())
+                                        create_graph=False, allow_unused=True)[0]
+                if g is None:
+                    continue
+                gla = g[0, lo:hi]
+                gmax = max(gmax, gla.abs().max().item())
+                gsq += float((gla * gla).sum().item())
             return gmax, gsq ** 0.5
-    except Exception:
+    except Exception as ex:
+        if not _GANG_DBG["printed"]:
+            import traceback
+            print(f"[fb][GANG 진단] 자동미분 실패 원인: {type(ex).__name__}: {ex}")
+            print(f"[fb][GANG 진단] policy 타입: {type(policy).__name__}, "
+                  f"get_actor_obs={hasattr(policy,'get_actor_obs')}, "
+                  f"actor={hasattr(policy,'actor')}, "
+                  f"normalizer={hasattr(policy,'actor_obs_normalizer')}")
+            _GANG_DBG["printed"] = True
         return float("nan"), float("nan")
+
 
 
 def _row_for_env(snap, e, prev=None, policy=None, full_obs=None):
@@ -309,4 +348,6 @@ _install_env_ref()
 _install_push_hook()
 _ok = _install_act_hook()
 if _ok:
-    print(f"[fb] ready (FB_WARN={FB_WARN}). lock first blowup env, trace past/future + GANG/dA-dL.")
+    print(f"[fb] ready. FB_WARN={FB_WARN} FB_SKIP={FB_SKIP} FB_REPEAT={FB_REPEAT} "
+          f"FB_PUSHWIN={FB_PUSHWIN} FB_AFTER={FB_AFTER} FB_JAC={FB_JAC}")
+    print(f"[fb] >>> 위 값이 네가 준 환경변수와 같은지 확인! 다르면 새 파일이 안 옮겨졌거나 env var 미적용.")
